@@ -1214,3 +1214,33 @@ func TestCreatePatchForCRD(t *testing.T) {
 
 	require.Equal(t, "{}", string(patch.data), "CRD with no changes should result in empty patch")
 }
+
+func TestCheckOwnership(t *testing.T) {
+	owned := func(labels, annotations map[string]string) runtime.Object {
+		return &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "cm", Labels: labels, Annotations: annotations}}
+	}
+	helmAnnotations := map[string]string{
+		"meta.helm.sh/release-name":      "rel",
+		"meta.helm.sh/release-namespace": "ns",
+	}
+
+	t.Run("owned by the release", func(t *testing.T) {
+		obj := owned(map[string]string{"app.kubernetes.io/managed-by": "Helm"}, helmAnnotations)
+		require.NoError(t, checkOwnership(obj, "rel", "ns"))
+	})
+
+	t.Run("not managed by helm", func(t *testing.T) {
+		err := checkOwnership(owned(nil, nil), "rel", "ns")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `missing key "app.kubernetes.io/managed-by": must be set to "Helm"`)
+		assert.Contains(t, err.Error(), `missing key "meta.helm.sh/release-name": must be set to "rel"`)
+		assert.Contains(t, err.Error(), `missing key "meta.helm.sh/release-namespace": must be set to "ns"`)
+	})
+
+	t.Run("owned by another release", func(t *testing.T) {
+		obj := owned(map[string]string{"app.kubernetes.io/managed-by": "Helm"}, helmAnnotations)
+		err := checkOwnership(obj, "other", "ns")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `key "meta.helm.sh/release-name" must equal "other": current value is "rel"`)
+	})
+}

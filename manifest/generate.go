@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"reflect"
+	"strings"
 
 	jsonpatch "github.com/evanphx/json-patch/v5"
 	jsoniter "github.com/json-iterator/go"
@@ -16,6 +17,7 @@ import (
 	authorizationv1 "k8s.io/api/authorization/v1"
 	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -54,7 +56,10 @@ var ValidThreeWayMergeModes = []string{
 }
 
 type generateOptions struct {
-	mergeMode ThreeWayMergeMode
+	mergeMode        ThreeWayMergeMode
+	releaseName      string
+	releaseNamespace string
+	takeOwnership    bool
 }
 
 // GenerateOption customizes the behavior of Generate.
@@ -65,6 +70,23 @@ type GenerateOption func(*generateOptions)
 func WithThreeWayMergeMode(mode ThreeWayMergeMode) GenerateOption {
 	return func(o *generateOptions) {
 		o.mergeMode = mode
+	}
+}
+
+// WithRelease names the release the manifests belong to. It enables the same
+// ownership check helm performs before adopting a resource that already exists
+// in the cluster but is not part of the original release.
+func WithRelease(name, namespace string) GenerateOption {
+	return func(o *generateOptions) {
+		o.releaseName = name
+		o.releaseNamespace = namespace
+	}
+}
+
+// WithTakeOwnership skips the ownership check, like helm's --take-ownership.
+func WithTakeOwnership(takeOwnership bool) GenerateOption {
+	return func(o *generateOptions) {
+		o.takeOwnership = takeOwnership
 	}
 }
 
@@ -109,7 +131,7 @@ func Generate(actionConfig *action.Configuration, originalManifest, targetManife
 		}
 	}
 
-	toBeUpdated, err := existingResourceConflict(toBeCreated)
+	toBeUpdated, unowned, err := existingResourceConflict(toBeCreated, options)
 	if err != nil {
 		return nil, nil, fmt.Errorf("rendered manifests contain a resource that already exists. Unable to continue with update: %w", err)
 	}
@@ -133,6 +155,21 @@ func Generate(actionConfig *action.Configuration, originalManifest, targetManife
 			return err
 		}
 		kind := info.Mapping.GroupVersionKind.Kind
+
+		// helm refuses to adopt a live object without matching ownership
+		// metadata, so merging the chart into it would predict an upgrade
+		// that cannot happen. Worse, a chart that renders the object as it
+		// already is would vanish from the diff altogether (#716). Show it as
+		// a new resource instead and tell the user why.
+		if cause, ok := unowned[objectKey(info)]; ok {
+			_, _ = fmt.Fprintf(os.Stderr, "Warning: %s already exists in the cluster and cannot be imported into the current release: %v\n"+
+				"It is shown as a new resource. helm upgrade will fail unless it carries the release's ownership metadata or --take-ownership is used.\n",
+				resourceString(info), cause)
+			out, _ := yaml.Marshal(info.Object)
+			installManifest = append(installManifest, yamlSeparator...)
+			installManifest = append(installManifest, out...)
+			return nil
+		}
 
 		// Fetch the current object for the three-way merge
 		helper := resource.NewHelper(info.Client, info.Mapping)
@@ -683,8 +720,13 @@ func objectKey(r *resource.Info) string {
 	return fmt.Sprintf("%s/%s/%s/%s", gvk.GroupVersion().String(), gvk.Kind, r.Namespace, r.Name)
 }
 
-func existingResourceConflict(resources kube.ResourceList) (kube.ResourceList, error) {
+// existingResourceConflict returns the resources that exist in the cluster and
+// will be adopted by the release. Resources that exist but would be refused
+// adoption because of their ownership metadata are returned separately, keyed by
+// objectKey, together with the reason.
+func existingResourceConflict(resources kube.ResourceList, options generateOptions) (kube.ResourceList, map[string]error, error) {
 	var requireUpdate kube.ResourceList
+	unowned := make(map[string]error)
 
 	err := resources.Visit(func(info *resource.Info, err error) error {
 		if err != nil {
@@ -692,7 +734,7 @@ func existingResourceConflict(resources kube.ResourceList) (kube.ResourceList, e
 		}
 
 		helper := resource.NewHelper(info.Client, info.Mapping)
-		_, err = helper.Get(info.Namespace, info.Name)
+		existing, err := helper.Get(info.Namespace, info.Name)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				return nil
@@ -700,9 +742,55 @@ func existingResourceConflict(resources kube.ResourceList) (kube.ResourceList, e
 			return fmt.Errorf("could not get information about the resource: %w", err)
 		}
 
+		if options.releaseName != "" && !options.takeOwnership {
+			if err := checkOwnership(existing, options.releaseName, options.releaseNamespace); err != nil {
+				unowned[objectKey(info)] = err
+				return nil
+			}
+		}
+
 		requireUpdate.Append(info)
 		return nil
 	})
 
-	return requireUpdate, err
+	return requireUpdate, unowned, err
+}
+
+// checkOwnership mirrors helm's validation of the ownership metadata a resource
+// needs to be adopted into a release.
+func checkOwnership(obj runtime.Object, releaseName, releaseNamespace string) error {
+	accessor, err := meta.Accessor(obj)
+	if err != nil {
+		return err
+	}
+
+	var errs []string
+	if err := requireValue(accessor.GetLabels(), "app.kubernetes.io/managed-by", "Helm"); err != nil {
+		errs = append(errs, "label validation error: "+err.Error())
+	}
+	if err := requireValue(accessor.GetAnnotations(), "meta.helm.sh/release-name", releaseName); err != nil {
+		errs = append(errs, "annotation validation error: "+err.Error())
+	}
+	if err := requireValue(accessor.GetAnnotations(), "meta.helm.sh/release-namespace", releaseNamespace); err != nil {
+		errs = append(errs, "annotation validation error: "+err.Error())
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("invalid ownership metadata; %s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+func requireValue(m map[string]string, k, v string) error {
+	actual, ok := m[k]
+	if !ok {
+		return fmt.Errorf("missing key %q: must be set to %q", k, v)
+	}
+	if actual != v {
+		return fmt.Errorf("key %q must equal %q: current value is %q", k, v, actual)
+	}
+	return nil
+}
+
+func resourceString(info *resource.Info) string {
+	return fmt.Sprintf("%s %q in namespace %q", info.Mapping.GroupVersionKind.Kind, info.Name, info.Namespace)
 }
